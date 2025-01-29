@@ -52,11 +52,13 @@ struct CommonOpts {
 impl CommonOpts {
     fn load_instance(&self) -> Result<Instance> {
         let reader = BufReader::new(File::open(&self.hypergraph)?);
-        if self.json {
-            Instance::load_from_json(reader)
-        } else {
-            Instance::load_from_text(reader)
-        }
+        // for PaceChallenge
+        Instance::load_from_hgr(reader)
+        // if self.json {
+        //     Instance::load_from_json(reader)
+        // } else {
+        //     Instance::load_from_text(reader)
+        // }
     }
 }
 
@@ -114,6 +116,12 @@ fn solve(opts: SolveOpts) -> Result<()> {
 
     info!("Solving {:?}", &opts.common.hypergraph);
     let (final_hs, report) = solve::solve(instance, file_name, settings)?;
+
+    // PaceChal Output
+    print!("{}\n", final_hs.len());
+    for h in &final_hs {
+        print!("{}\n", ((usize::from(*h)) +1));
+    }
 
     if let Some(solution_file) = opts.solution {
         debug!("Writing solution to {}", solution_file.display());

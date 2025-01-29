@@ -1,5 +1,5 @@
 use crate::{
-    instance::{Instance, NodeIdx},
+    instance::{Instance, NodeIdx, EdgeIdx},
     lower_bound::{self, PackingBound},
     reductions::{self, ReductionResult},
     report::{ReductionStats, Report, RootBounds, RuntimeStats, Settings, UpperBoundImprovement},
@@ -8,6 +8,26 @@ use crate::{
 use anyhow::{ensure, Result};
 use log::{debug, info, trace, warn};
 use std::time::Instant;
+
+/// ***************************************************************
+/// LP STUFF
+
+extern crate glpk_sys as glpk;
+
+use std::ffi::CString;
+use std::ptr;
+use std::os::raw::*;
+
+const GLP_MIN: i32 = 1;  // Minimization objective
+const GLP_MAX: i32 = 2;  // Maximization objective
+
+const GLP_LO: i32 = 2;   // Lower bound
+const GLP_UP: i32 = 3;   // Upper bound
+
+const GLP_BV: i32 = 3;   // Binary variable
+const GLP_DB: i32 = 4;   // Double bounded
+const GLP_OPT: i32 = 5;
+/// ***************************************************************
 
 const ITERATION_LOG_INTERVAL_SECS: u64 = 60;
 
@@ -33,14 +53,20 @@ fn branch_on(
     instance: &mut Instance,
     state: &mut State,
     report: &mut Report,
+    vertex_importance: &mut Vec<f64>,
+    global_lower_bound: usize,
 ) -> Status {
+    // TODO check if this is valid
+    // if state.partial_hs.len() + 1 >= state.minimum_hs.len() {
+    //     return Status::Stop;
+    // }
     trace!("Branching on {}", node);
     report.branching_steps += 1;
     instance.delete_node(node);
 
     instance.delete_incident_edges(node);
     state.partial_hs.push(node);
-    let status_without = solve_recursive(instance, state, report);
+    let status_without = solve_recursive(instance, state, report, vertex_importance, global_lower_bound);
     debug_assert_eq!(state.partial_hs.last().copied(), Some(node));
     state.partial_hs.pop();
     instance.restore_incident_edges(node);
@@ -50,12 +76,47 @@ fn branch_on(
         return Status::Stop;
     }
 
-    let status_with = solve_recursive(instance, state, report);
+    let status_with = solve_recursive(instance, state, report, vertex_importance, global_lower_bound);
     instance.restore_node(node);
     status_with
 }
 
-fn solve_recursive(instance: &mut Instance, state: &mut State, report: &mut Report) -> Status {
+fn select_vertex(instance: &Instance, vertex_importance: &[f64]) -> NodeIdx {
+    // let epsilon = 0.05;
+    instance
+        .nodes()
+        .iter()
+        .copied()
+        // importance, but thresholded, then degree
+        // .max_by(|&a, &b| {
+        //     let cmp = vertex_importance[a.idx()]
+        //         .partial_cmp(&vertex_importance[b.idx()])
+        //         .unwrap_or(std::cmp::Ordering::Equal);
+            
+        //     if cmp == std::cmp::Ordering::Equal || 
+        //        (vertex_importance[a.idx()] - vertex_importance[b.idx()]).abs() < epsilon {
+        //         instance.node_degree(a).cmp(&instance.node_degree(b))
+        //     } else {
+        //         cmp
+        //     }
+        // })
+        // product of degree and importance
+        .max_by(|&a, &b| {
+            let score_a = vertex_importance[a.idx()] * instance.node_degree(a) as f64;
+            let score_b = vertex_importance[b.idx()] * instance.node_degree(b) as f64;
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // (importance, degree)
+        // .max_by(|&a, &b| 
+        //     vertex_importance[a.idx()]
+        //         .partial_cmp(&vertex_importance[b.idx()])
+        //         .unwrap_or(std::cmp::Ordering::Equal)
+        //         .then_with(|| instance.node_degree(a).cmp(&instance.node_degree(b)))
+        // )
+        .expect("Branching on an empty instance")
+}
+
+fn solve_recursive(instance: &mut Instance, state: &mut State, report: &mut Report, vertex_importance: &mut Vec<f64>, global_lower_bound: usize,) -> Status {
     let now = Instant::now();
     if (now - state.last_log_time).as_secs() >= ITERATION_LOG_INTERVAL_SECS {
         info!(
@@ -65,7 +126,27 @@ fn solve_recursive(instance: &mut Instance, state: &mut State, report: &mut Repo
         state.last_log_time = now;
     }
 
+    if state.minimum_hs.len() <= global_lower_bound {
+        info!("Hit global lower bound computed by LP");
+        return Status::Stop;
+    }
+
     let (reduction_result, reduction) = reductions::reduce(instance, state, report);
+    /*
+    if instance.nodes().len() <= 100 && instance.edges().len() <= 50 {
+        let (ilp_result, mut ilp_solution) = solve_ilp(&instance);
+        if ilp_result < usize::MAX {
+            if state.partial_hs.len() + ilp_result < state.minimum_hs.len() {
+                info!("Found HS of size {} by ILP", state.partial_hs.len() + ilp_result);
+                state.minimum_hs.clear();
+                state.minimum_hs.extend(state.partial_hs.iter().copied());
+                state.minimum_hs.extend(ilp_solution.iter().copied());
+            }
+            return Status::Stop;
+        }
+    }
+    */
+
     let status = match reduction_result {
         ReductionResult::Solved => {
             if state.partial_hs.len() < state.minimum_hs.len() {
@@ -94,13 +175,8 @@ fn solve_recursive(instance: &mut Instance, state: &mut State, report: &mut Repo
         ReductionResult::Unsolvable => Status::Continue,
         ReductionResult::Stop => Status::Stop,
         ReductionResult::Finished => {
-            let node = instance
-                .nodes()
-                .iter()
-                .copied()
-                .max_by_key(|&node| instance.node_degree(node))
-                .expect("Branching on an empty instance");
-            branch_on(node, instance, state, report)
+            let node = select_vertex(instance, &vertex_importance);
+            branch_on(node, instance, state, report, vertex_importance, global_lower_bound)
         }
     };
 
@@ -154,17 +230,264 @@ fn calculate_root_bounds(instance: &Instance, settings: &Settings) -> RootBounds
     }
 }
 
+pub fn solve_lp(instance: &Instance) -> (usize, Vec<f64>) {
+    unsafe {
+        glpk::glp_term_out(0);
+
+        let lp = glpk::glp_create_prob();
+
+        glpk::glp_set_prob_name(lp, CString::new("hitting_set_lp").unwrap().as_ptr());
+        glpk::glp_set_obj_dir(lp, GLP_MIN);
+
+        let num_sets = instance.num_edges_total();
+        glpk::glp_add_rows(lp, num_sets as i32);
+
+        let num_elements = instance.num_nodes_total();
+        glpk::glp_add_cols(lp, num_elements as i32);
+
+        for i in 0..num_elements {
+            let col_idx = (i + 1) as i32;
+
+            glpk::glp_set_col_bnds(lp, col_idx, GLP_DB, 0.0, 1.0);
+
+            glpk::glp_set_obj_coef(lp, col_idx, 1.0);
+        }
+
+        for j in 0..num_sets {
+            let row_idx = (j + 1) as i32;
+
+            glpk::glp_set_row_bnds(lp, row_idx, GLP_LO, 1.0, f64::INFINITY);
+        }
+
+        let mut ia: Vec<c_int> = Vec::new();
+        let mut ja: Vec<c_int> = Vec::new();
+        let mut ar: Vec<c_double> = Vec::new();
+
+        ia.push(0 as c_int);
+        ja.push(0 as c_int);
+        ar.push(0.0 as c_double);
+
+        for j in 0..num_sets {
+            let row_idx = (j + 1) as c_int;
+
+            for element in instance.edge(EdgeIdx::from(j)) {
+                let col_idx = (element.idx() + 1) as c_int;
+
+                ia.push(row_idx);
+                ja.push(col_idx);
+                ar.push(1.0);
+            }
+        }
+
+        assert!(ia.len() == ja.len());
+        assert!(ia.len() == ar.len());
+
+        glpk::glp_load_matrix(lp, (ia.len() - 1) as i32, ia.as_ptr(), ja.as_ptr(), ar.as_ptr());
+        
+        // glpk::glp_write_lp(lp, ptr::null(), CString::new("debug.lp").unwrap().as_ptr());
+
+        glpk::glp_simplex(lp, ptr::null());
+
+        let z = glpk::glp_get_obj_val(lp).ceil() as usize;
+        info!("LP: Objective value (z) = {}", z);
+
+        let mut vertex_importance = Vec::with_capacity(num_elements);
+        for i in 0..num_elements {
+            let col_idx = (i + 1) as i32;
+            let value = glpk::glp_get_col_prim(lp, col_idx);
+            vertex_importance.push(value);
+        }
+
+        glpk::glp_delete_prob(lp);
+
+        (z, vertex_importance)
+    }
+}
+
+/*
+pub fn solve_dual_lp(instance: &Instance) -> usize {
+    unsafe {
+        glpk::glp_term_out(0);
+
+        let lp = glpk::glp_create_prob();
+        glpk::glp_set_prob_name(lp, CString::new("hitting_set_dual_lp").unwrap().as_ptr());
+        glpk::glp_set_obj_dir(lp, GLP_MAX);
+
+        let num_elements = instance.num_nodes_total();
+        glpk::glp_add_rows(lp, num_elements as i32);
+
+        let num_sets = instance.num_edges_total();
+        glpk::glp_add_cols(lp, num_sets as i32);
+
+        for j in 0..num_sets {
+            let col_idx = (j + 1) as i32;
+            // glpk::glp_set_col_bnds(lp, col_idx, GLP_LO, 0.0, f64::INFINITY);
+            glpk::glp_set_col_bnds(lp, col_idx, GLP_DB, 0.0, 1.0);
+            glpk::glp_set_obj_coef(lp, col_idx, 1.0);
+            glpk::glp_set_col_kind(lp, col_idx, GLP_BV);
+        }
+
+        let mut total_size = 0;
+        for i in 0..num_elements {
+            let row_idx = (i + 1) as i32;
+            glpk::glp_set_row_bnds(lp, row_idx, GLP_UP, f64::NEG_INFINITY, 1.0);
+
+            total_size += instance.node_degree(NodeIdx::from(i));
+        }
+
+        let mut ia: Vec<c_int> = Vec::with_capacity(total_size + 1);
+        let mut ja: Vec<c_int> = Vec::with_capacity(total_size + 1);
+        let mut ar: Vec<c_double> = Vec::with_capacity(total_size + 1);
+
+        ia.push(0 as c_int);
+        ja.push(0 as c_int);
+        ar.push(0.0 as c_double);
+
+        for j in 0..num_sets {
+            for element in instance.edge(EdgeIdx::from(j)) {
+                ia.push((element.idx() + 1) as c_int);
+                ja.push((j + 1) as c_int);
+                ar.push(1.0);
+            }
+        }
+
+        glpk::glp_load_matrix(lp, (ia.len()-1) as i32, ia.as_ptr(), ja.as_ptr(), ar.as_ptr());
+
+        let mut io_params = std::mem::zeroed::<glpk::glp_iocp>();
+        glpk::glp_init_iocp(&mut io_params);
+        io_params.presolve = 1;
+
+        glpk::glp_intopt(lp, &io_params);
+
+        let his_bound = glpk::glp_mip_obj_val(lp) as usize;
+
+        glpk::glp_delete_prob(lp);
+        his_bound
+    }
+}
+
+pub fn solve_ilp(instance: &Instance) -> (usize, Vec<NodeIdx>) {
+    unsafe {
+        glpk::glp_term_out(0);
+
+        let lp = glpk::glp_create_prob();
+
+        glpk::glp_set_prob_name(lp, CString::new("hitting_set_ilp").unwrap().as_ptr());
+        glpk::glp_set_obj_dir(lp, GLP_MIN);
+
+        let num_sets = instance.num_edges_total();
+        glpk::glp_add_rows(lp, num_sets as i32);
+
+        let num_elements = instance.num_nodes_total();
+        glpk::glp_add_cols(lp, num_elements as i32);
+
+        let mut total_size = 0;
+        for i in 0..num_elements {
+            let col_idx = (i + 1) as i32;
+
+            glpk::glp_set_col_bnds(lp, col_idx, GLP_DB, 0.0, 1.0);
+            glpk::glp_set_obj_coef(lp, col_idx, 1.0);
+            glpk::glp_set_col_kind(lp, col_idx, GLP_BV);
+
+            total_size += instance.node_degree(NodeIdx::from(i));
+        }
+
+        for j in 0..num_sets {
+            let row_idx = (j + 1) as i32;
+            glpk::glp_set_row_bnds(lp, row_idx, GLP_LO, 1.0, f64::INFINITY);
+        }
+
+        let mut ia: Vec<c_int> = Vec::with_capacity(total_size + 1);
+        let mut ja: Vec<c_int> = Vec::with_capacity(total_size + 1);
+        let mut ar: Vec<c_double> = Vec::with_capacity(total_size + 1);
+
+        ia.push(0 as c_int);
+        ja.push(0 as c_int);
+        ar.push(0.0 as c_double);
+
+        for j in 0..num_sets {
+            let row_idx = (j + 1) as c_int;
+
+            for element in instance.edge(EdgeIdx::from(j)) {
+                let col_idx = (element.idx() + 1) as c_int;
+
+                ia.push(row_idx);
+                ja.push(col_idx);
+                ar.push(1.0);
+            }
+        }
+
+        assert!(ia.len() == ja.len());
+        assert!(ia.len() == ar.len());
+
+        glpk::glp_load_matrix(lp, (ia.len()-1) as i32, ia.as_ptr(), ja.as_ptr(), ar.as_ptr());
+
+        // glpk::glp_scale_prob(lp, 0x80);
+        // glpk::glp_write_lp(lp, ptr::null(), CString::new("debug.ilp").unwrap().as_ptr());
+
+        let simplex_status = glpk::glp_simplex(lp, ptr::null());
+        if simplex_status != 0 {
+            info!("Simplex phase failed with status: {}", simplex_status);
+            return (usize::MAX, vec![]);
+        }
+        
+        let ilp_status = glpk::glp_intopt(lp, ptr::null());
+        if ilp_status != 0 {
+            info!("GLPK Integer Optimization failed. Status: {}", ilp_status);
+            return (usize::MAX, vec![]);
+        }
+
+        let z = glpk::glp_mip_obj_val(lp).ceil() as usize;
+        info!("ILP Objective value (z) = {}", z);
+
+        let mut result = Vec::with_capacity(z);
+
+        for i in 0..num_elements {
+            let col_idx = (i + 1) as i32;
+            let value = glpk::glp_mip_col_val(lp, col_idx) as i32;
+
+            if value == 1 {
+                result.push(NodeIdx::from(i));
+            }
+        }
+
+        glpk::glp_delete_prob(lp);
+
+        (z, result)
+    }
+}
+*/
+
 pub fn solve(
     mut instance: Instance,
     file_name: String,
     settings: Settings,
 ) -> Result<(Vec<NodeIdx>, Report)> {
-    let initial_hs = get_initial_hitting_set(&instance, &settings)?;
+
+    let before = Instant::now();
+    let (lp_bound, mut vertex_importance) = solve_lp(&instance);
+    let time_spend_lp = before.elapsed();
+
+    // let dual_lp_bound = solve_dual_lp(&instance);
+    // info!("Dual LP Bound: {}", dual_lp_bound);
+    
+    let lp_hitting_set = reductions::calc_greedy_approximation_from_vec(&mut instance, &mut vertex_importance);
+
+    ensure!(
+        is_hitting_set(&lp_hitting_set, &mut instance),
+        "LP-guided greedy HS is not valid"
+    );
+
+    info!("Size of LP-guided greedy HS: {}, took {:.2?}", lp_hitting_set.len(), time_spend_lp);
+
+    // let (_, mut ilp_solution) = solve_ilp(&instance);
+
+    // let initial_hs = get_initial_hitting_set(&instance, &settings)?;
     let root_bounds = calculate_root_bounds(&instance, &settings);
     let packing_from_scratch_limit = settings.packing_from_scratch_limit;
     let mut report = Report {
         file_name,
-        opt: initial_hs.len(),
+        opt: lp_hitting_set.len(),
         branching_steps: 0,
         settings,
         root_bounds,
@@ -175,11 +498,12 @@ pub fn solve(
 
     let mut state = State {
         partial_hs: Vec::new(),
-        minimum_hs: initial_hs,
+        minimum_hs: lp_hitting_set,
         last_log_time: Instant::now(),
         solve_start_time: Instant::now(),
     };
-    let status = solve_recursive(&mut instance, &mut state, &mut report);
+
+    let status = solve_recursive(&mut instance, &mut state, &mut report, &mut vertex_importance, lp_bound);
     report.runtimes.total = state.solve_start_time.elapsed();
     report.opt = state.minimum_hs.len();
 

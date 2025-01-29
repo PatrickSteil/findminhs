@@ -181,6 +181,74 @@ impl Instance {
         Ok(instance)
     }
 
+    /// Loads a hypergraph instance from a DIMACS HGR file.
+    pub fn load_from_hgr(mut reader: impl BufRead) -> Result<Self> {
+        let time_before = Instant::now();
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            reader.read_line(&mut line)?;
+            if line.starts_with('c') {
+                continue;
+            }
+            if line.starts_with('p') {
+                break;
+            }
+            return Err(anyhow!("Expected problem line starting with 'p'"));
+        }
+
+        let mut parts = line.split_ascii_whitespace();
+        ensure!(parts.next() == Some("p"), "Expected 'p' at start of problem line");
+        ensure!(parts.next() == Some("hs"), "Expected 'hs' in problem line");
+        let num_nodes: usize = parts
+            .next()
+            .ok_or_else(|| anyhow!("Missing node count"))?
+            .parse()?;
+        let num_edges: usize = parts
+            .next()
+            .ok_or_else(|| anyhow!("Missing edge count"))?
+            .parse()?;
+        ensure!(
+            parts.next().is_none(),
+            "Too many numbers in problem line"
+        );
+
+        let instance = Self::load(num_nodes, num_edges, |handler| {
+            for _ in 0..num_edges {
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line)?;
+
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('c') {
+                        continue;
+                    }
+
+                    let node_indices = trimmed
+                        .split_ascii_whitespace()
+                        .map(|s| {
+                            let idx: usize = s.parse()?;
+                            ensure!(idx >= 1 && idx <= num_nodes, "Invalid node index in edge: {}", idx);
+                            Ok(idx - 1)
+                        });
+
+                    handler.handle_edge(node_indices)?;
+                    break;
+                }
+            }
+            Ok(())
+        })?;
+
+        info!(
+            "Loaded HGR instance with {} nodes, {} edges in {:.2?}",
+            num_nodes,
+            num_edges,
+            time_before.elapsed(),
+        );
+
+        Ok(instance)
+    }
     pub fn num_edges(&self) -> usize {
         self.edges.len()
     }
@@ -225,6 +293,15 @@ impl Instance {
 
     pub fn node_degree(&self, node: NodeIdx) -> usize {
         self.node_incidences[node.idx()].len()
+    }
+
+    /// Computes the weighted degree of a node, which is the sum of the edge sizes
+    /// in which the node is incident.
+    pub fn node_weighted_degree(&self, node: NodeIdx) -> usize {
+        self.node_incidences[node.idx()]
+            .iter()
+            .map(|(_, (edge, _))| self.edge_size(*edge))
+            .sum()
     }
 
     pub fn edge_size(&self, edge: EdgeIdx) -> usize {

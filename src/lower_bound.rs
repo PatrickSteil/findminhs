@@ -9,13 +9,106 @@ use std::iter::Peekable;
 
 create_idx_struct!(PackingIdx);
 
+/// ***************************************************************
+/// LP STUFF
+
+extern crate glpk_sys as glpk;
+
+use std::ffi::CString;
+use std::ptr;
+use std::os::raw::*;
+
+const GLP_MIN: i32 = 1;  // Minimization objective
+const GLP_MAX: i32 = 2;  // Maximization objective
+
+const GLP_LO: i32 = 2;   // Lower bound
+const GLP_UP: i32 = 3;   // Upper bound
+
+const GLP_BV: i32 = 3;   // Binary variable
+const GLP_DB: i32 = 4;   // Double bounded
+const GLP_OPT: i32 = 5;
+/// ***************************************************************
+
+// TODO: make it work with the current instance, not the global one
+pub fn calc_lp_bound(instance: &Instance) -> Option<usize> {
+    unsafe {
+        glpk::glp_term_out(0);
+
+        let lp = glpk::glp_create_prob();
+
+        // glpk::glp_set_prob_name(lp, CString::new("hitting_set_lower_bound_lp").unwrap().as_ptr());
+        glpk::glp_set_obj_dir(lp, GLP_MIN);
+
+        let num_sets = instance.num_edges_total();
+        glpk::glp_add_rows(lp, num_sets as i32);
+
+        let num_elements = instance.num_nodes_total();
+        glpk::glp_add_cols(lp, num_elements as i32);
+
+        for i in 0..num_elements {
+            let col_idx = (i + 1) as i32;
+
+            glpk::glp_set_col_bnds(lp, col_idx, GLP_DB, 0.0, 1.0);
+
+            glpk::glp_set_obj_coef(lp, col_idx, 1.0);
+        }
+
+        for j in 0..num_sets {
+            let row_idx = (j + 1) as i32;
+
+            glpk::glp_set_row_bnds(lp, row_idx, GLP_LO, 1.0, f64::INFINITY);
+        }
+
+        let mut ia: Vec<c_int> = Vec::new();
+        let mut ja: Vec<c_int> = Vec::new();
+        let mut ar: Vec<c_double> = Vec::new();
+
+        ia.push(0 as c_int);
+        ja.push(0 as c_int);
+        ar.push(0.0 as c_double);
+
+        for j in 0..num_sets {
+            // TODO write a method that takes the index j, and recides whether it should be skipped or not.
+            // for example, i want to pass something like this (this is C++): [&](const auto j) {bool prune = (isHit[j]); return prune;}
+            // it should prune when true, and do nothing if false
+            let row_idx = (j + 1) as c_int;
+
+            for element in instance.edge(EdgeIdx::from(j)) {
+                let col_idx = (element.idx() + 1) as c_int;
+
+                ia.push(row_idx);
+                ja.push(col_idx);
+                ar.push(1.0);
+            }
+        }
+
+        assert!(ia.len() == ja.len());
+        assert!(ia.len() == ar.len());
+
+        glpk::glp_load_matrix(lp, (ia.len() - 1) as i32, ia.as_ptr(), ja.as_ptr(), ar.as_ptr());
+        
+        glpk::glp_simplex(lp, ptr::null());
+
+        let z = glpk::glp_get_obj_val(lp).ceil() as usize;
+        glpk::glp_delete_prob(lp);
+
+        Some(z)
+    }
+}
+
+
 pub fn calc_max_degree_bound(instance: &Instance) -> Option<usize> {
     instance
         .nodes()
         .iter()
         .map(|&node| instance.node_degree(node))
         .max()
-        .map(|max_degree| (instance.num_edges() + max_degree - 1) / max_degree)
+        // .map(|max_degree| (instance.num_edges() + max_degree - 1) / max_degree)
+        .and_then(|max_degree| if max_degree > 0 {
+            Some((instance.num_edges() + max_degree - 1) / max_degree)
+        } else {
+            None
+        })
 }
 
 pub fn calc_sum_degree_bound(instance: &Instance) -> usize {

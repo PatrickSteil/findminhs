@@ -33,6 +33,9 @@ pub struct RuntimeStats {
     pub sum_over_packing_bound: Duration,
 
     #[serde(serialize_with = "serialize_duration_as_seconds")]
+    pub discarded_vertex: Duration,
+
+    #[serde(serialize_with = "serialize_duration_as_seconds")]
     pub forced_vertex: Duration,
 
     #[serde(serialize_with = "serialize_duration_as_seconds")]
@@ -49,6 +52,9 @@ pub struct RuntimeStats {
 
     #[serde(serialize_with = "serialize_duration_as_seconds")]
     pub applying_reductions: Duration,
+
+    #[serde(serialize_with = "serialize_duration_as_seconds")]
+    pub lp_bound: Duration,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,8 +73,11 @@ pub struct ReductionStats {
     pub efficiency_degree_bound_breaks: usize,
     pub packing_bound_breaks: usize,
     pub sum_over_packing_bound_breaks: usize,
+    pub lp_bound_breaks: usize,
 
     pub greedy_runs: usize,
+    pub discard_vertex_runs: usize,
+    pub discard_vertices_found: usize,
     pub forced_vertex_runs: usize,
     pub forced_vertices_found: usize,
     pub costly_discard_efficiency_runs: usize,
@@ -81,6 +90,7 @@ pub struct ReductionStats {
     pub vertex_dominations_vertices_found: usize,
     pub edge_dominations_runs: usize,
     pub edge_dominations_edges_found: usize,
+    pub lp_bound_breaks_runs: usize,
 }
 
 impl ReductionStats {
@@ -142,6 +152,9 @@ pub struct Settings {
 
     /// Hitting set to initialize the solver with
     pub initial_hitting_set: Option<Vec<NodeIdx>>,
+
+    /// Compute Lower Bounds using LP
+    pub enable_lp_lower_bound: bool,
 
     /// Stop solving once a hitting set this size or smaller is found
     #[serde(default)]

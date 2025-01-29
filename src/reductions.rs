@@ -107,6 +107,37 @@ fn find_dominated_edges(instance: &Instance) -> impl Iterator<Item = ReducedItem
     })
 }
 
+use std::collections::HashSet;
+
+fn find_discard_vertex(instance: &Instance) -> impl Iterator<Item = ReducedItem> {
+    let mut marked_for_removal = HashSet::new();
+    let mut forced_nodes = HashSet::new();
+
+    let discard_candidates: Vec<_> = instance
+        .nodes()
+        .iter()
+        .copied()
+        .filter(|&node| instance.node(node).count() == 1)
+        .collect();
+
+    for &node in &discard_candidates {
+        let mut edges = instance.node(node);
+        let edge = edges.next().unwrap();
+        let edge_nodes: Vec<_> = instance.edge(edge).collect();
+
+        if edge_nodes.iter().any(|&w| w != node && !marked_for_removal.contains(&w)) {
+            marked_for_removal.insert(node);
+        } else {
+            forced_nodes.insert(node);
+        }
+    }
+
+    marked_for_removal
+        .into_iter()
+        .map(ReducedItem::RemovedNode)
+        .chain(forced_nodes.into_iter().map(ReducedItem::ForcedNode))
+}
+
 fn find_forced_nodes(instance: &Instance) -> impl Iterator<Item = ReducedItem> {
     let forced: IdxHashSet<_> = instance
         .edges()
@@ -193,17 +224,65 @@ fn find_costly_discard_using_packing_from_scratch(
         })
 }
 
+use std::cmp::Ordering;
+
+#[derive(PartialEq, PartialOrd)]
+struct NodeEntry {
+    importance: f64,
+    node: NodeIdx,
+}
+
+impl Eq for NodeEntry {}
+
+impl Ord for NodeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal).reverse()
+    }
+}
+
+pub fn calc_greedy_approximation_from_vec(instance: &Instance, importance: &[f64]) -> Vec<NodeIdx> {
+    let mut hit = vec![true; instance.num_edges_total()];
+    for edge in instance.edges() {
+        hit[edge.idx()] = false;
+    }
+
+    let mut node_queue = BinaryHeap::from(
+        instance.nodes().into_iter().map(|&node| NodeEntry {
+            importance: importance[node.idx()],
+            node,
+        }).collect::<Vec<_>>()
+    );
+
+    let mut hs = Vec::new();
+    while let Some(NodeEntry { importance: _, node }) = node_queue.pop() {
+        if instance.node(node).all(|edge| hit[edge.idx()]) {
+            continue;
+        }
+
+        hs.push(node);
+
+        for edge in instance.node(node) {
+            hit[edge.idx()] = true;
+        }
+    }
+
+    hs
+}
+
 pub fn calc_greedy_approximation(instance: &Instance) -> Vec<NodeIdx> {
     let mut hit = vec![true; instance.num_edges_total()];
     for edge in instance.edges() {
         hit[edge.idx()] = false;
     }
+
     let mut node_degrees = vec![0; instance.num_nodes_total()];
-    let mut node_queue = BinaryHeap::new();
-    for &node in instance.nodes() {
-        node_degrees[node.idx()] = instance.node_degree(node);
-        node_queue.push((node_degrees[node.idx()], node));
-    }
+    let mut node_queue = BinaryHeap::from(
+        instance.nodes().into_iter().map(|&node| {
+            let degree = instance.node_degree(node);
+            node_degrees[node.idx()] = degree;
+            (degree, node)
+        }).collect::<Vec<_>>()
+    );
 
     let mut hs = Vec::new();
     while let Some((degree, node)) = node_queue.pop() {
@@ -215,7 +294,7 @@ pub fn calc_greedy_approximation(instance: &Instance) -> Vec<NodeIdx> {
         }
 
         hs.push(node);
-        node_degrees[node.idx()] = 0; // Fewer elements in the heap
+        node_degrees[node.idx()] = 0;
         for edge in instance.node(node) {
             if hit[edge.idx()] {
                 continue;
@@ -337,6 +416,16 @@ pub fn reduce(
             }
         }
 
+        if report.settings.enable_lp_lower_bound {
+            let lp_bound = collect_time_info(&mut report.runtimes.lp_bound, || {
+                lower_bound::calc_lp_bound(instance).unwrap_or(usize::MAX)
+            });
+            if lp_bound >= lower_bound_breakpoint {
+                report.reductions.lp_bound_breaks += 1;
+                break ReductionResult::Unsolvable;
+            }
+        }
+
         let discard_efficiency_bounds = if report.settings.enable_efficiency_bound {
             let (efficiency_bound, discard_efficiency_bounds) =
                 collect_time_info(&mut report.runtimes.efficiency_bound, || {
@@ -377,6 +466,16 @@ pub fn reduce(
         }
 
         let unchanged_len = reduced_items.len();
+
+        // Remove degree one vertices which have a neighbour
+        run_reduction(
+            &mut reduced_items,
+            &mut report.runtimes.discarded_vertex,
+            &mut report.reductions.discard_vertex_runs,
+            &mut report.reductions.discard_vertices_found,
+            || find_discard_vertex(instance),
+        );
+        
         run_reduction(
             &mut reduced_items,
             &mut report.runtimes.forced_vertex,
@@ -384,6 +483,7 @@ pub fn reduce(
             &mut report.reductions.forced_vertices_found,
             || find_forced_nodes(instance),
         );
+
 
         if reduced_items.len() == unchanged_len && report.settings.enable_efficiency_bound {
             // Do not time this step as all costly parts are integrated into the
