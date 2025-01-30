@@ -253,6 +253,10 @@ impl Instance {
         self.edges.len()
     }
 
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn num_nodes_total(&self) -> usize {
         self.node_incidences.len()
     }
@@ -315,6 +319,14 @@ impl Instance {
             self.edge_incidences[edge.idx()].delete(entry_idx.idx());
         }
         self.nodes.delete(node.idx());
+    }
+
+    pub fn is_node_deleted(&mut self, node: NodeIdx) -> bool {
+        self.nodes.is_deleted(node.idx())
+    }
+
+    pub fn is_edge_deleted(&mut self, edge: EdgeIdx) -> bool {
+        self.edges.is_deleted(edge.idx())
     }
 
     /// Deletes an edge from the instance.

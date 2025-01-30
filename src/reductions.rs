@@ -117,10 +117,14 @@ fn find_discard_vertex(instance: &Instance) -> impl Iterator<Item = ReducedItem>
         .nodes()
         .iter()
         .copied()
-        .filter(|&node| instance.node(node).count() == 1)
+        .filter(|&node| instance.node_degree(node) <= 1)
         .collect();
 
     for &node in &discard_candidates {
+        if instance.node_degree(node) == 0 {
+            marked_for_removal.insert(node);
+            continue;
+        }
         let mut edges = instance.node(node);
         let edge = edges.next().unwrap();
         let edge_nodes: Vec<_> = instance.edge(edge).collect();
@@ -248,7 +252,8 @@ pub fn calc_greedy_approximation_from_vec(instance: &Instance, importance: &[f64
 
     let mut node_queue = BinaryHeap::from(
         instance.nodes().into_iter().map(|&node| NodeEntry {
-            importance: importance[node.idx()],
+            importance: importance[node.idx()] * (instance.node_degree(node) as f64),
+            // importance: importance[node.idx()],
             node,
         }).collect::<Vec<_>>()
     );
@@ -398,7 +403,7 @@ pub fn reduce(
         let mut lower_bound_breakpoint = state.minimum_hs.len() - state.partial_hs.len();
         if report.settings.enable_max_degree_bound {
             let max_degree_bound = collect_time_info(&mut report.runtimes.max_degree_bound, || {
-                lower_bound::calc_max_degree_bound(instance).unwrap_or(usize::MAX)
+                lower_bound::calc_max_degree_bound(instance).unwrap_or(0)
             });
             if max_degree_bound >= lower_bound_breakpoint {
                 report.reductions.max_degree_bound_breaks += 1;
@@ -416,22 +421,12 @@ pub fn reduce(
             }
         }
 
-        if report.settings.enable_lp_lower_bound {
-            let lp_bound = collect_time_info(&mut report.runtimes.lp_bound, || {
-                lower_bound::calc_lp_bound(instance).unwrap_or(usize::MAX)
-            });
-            if lp_bound >= lower_bound_breakpoint {
-                report.reductions.lp_bound_breaks += 1;
-                break ReductionResult::Unsolvable;
-            }
-        }
-
         let discard_efficiency_bounds = if report.settings.enable_efficiency_bound {
             let (efficiency_bound, discard_efficiency_bounds) =
                 collect_time_info(&mut report.runtimes.efficiency_bound, || {
                     lower_bound::calc_efficiency_bound(instance)
                 });
-            if efficiency_bound.round().unwrap_or(usize::MAX) >= lower_bound_breakpoint {
+            if efficiency_bound.round().unwrap_or(0) >= lower_bound_breakpoint {
                 report.reductions.efficiency_degree_bound_breaks += 1;
                 break ReductionResult::Unsolvable;
             }
@@ -461,6 +456,16 @@ pub fn reduce(
                 });
             if sum_over_packing_bound >= lower_bound_breakpoint {
                 report.reductions.sum_over_packing_bound_breaks += 1;
+                break ReductionResult::Unsolvable;
+            }
+        }
+
+        if report.settings.enable_lp_lower_bound {
+            let lp_bound = collect_time_info(&mut report.runtimes.lp_bound, || {
+                lower_bound::calc_lp_bound(instance).unwrap_or(0)
+            });
+            if lp_bound >= lower_bound_breakpoint {
+                report.reductions.lp_bound_breaks += 1;
                 break ReductionResult::Unsolvable;
             }
         }

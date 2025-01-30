@@ -29,27 +29,26 @@ const GLP_DB: i32 = 4;   // Double bounded
 const GLP_OPT: i32 = 5;
 /// ***************************************************************
 
-// TODO: make it work with the current instance, not the global one
 pub fn calc_lp_bound(instance: &Instance) -> Option<usize> {
     unsafe {
         glpk::glp_term_out(0);
 
         let lp = glpk::glp_create_prob();
 
-        // glpk::glp_set_prob_name(lp, CString::new("hitting_set_lower_bound_lp").unwrap().as_ptr());
+        glpk::glp_set_prob_name(lp, CString::new("hitting_set_lower_bound_lp").unwrap().as_ptr());
         glpk::glp_set_obj_dir(lp, GLP_MIN);
 
-        let num_sets = instance.num_edges_total();
+        let num_sets = instance.num_edges();
         glpk::glp_add_rows(lp, num_sets as i32);
 
         let num_elements = instance.num_nodes_total();
         glpk::glp_add_cols(lp, num_elements as i32);
 
+
         for i in 0..num_elements {
             let col_idx = (i + 1) as i32;
 
             glpk::glp_set_col_bnds(lp, col_idx, GLP_DB, 0.0, 1.0);
-
             glpk::glp_set_obj_coef(lp, col_idx, 1.0);
         }
 
@@ -67,14 +66,15 @@ pub fn calc_lp_bound(instance: &Instance) -> Option<usize> {
         ja.push(0 as c_int);
         ar.push(0.0 as c_double);
 
-        for j in 0..num_sets {
-            // TODO write a method that takes the index j, and recides whether it should be skipped or not.
-            // for example, i want to pass something like this (this is C++): [&](const auto j) {bool prune = (isHit[j]); return prune;}
-            // it should prune when true, and do nothing if false
+        for (j, &edge) in instance.edges().into_iter().enumerate() {
             let row_idx = (j + 1) as c_int;
 
-            for element in instance.edge(EdgeIdx::from(j)) {
-                let col_idx = (element.idx() + 1) as c_int;
+            assert!(j+1 <= num_sets);
+
+            for node in instance.edge(edge) {
+                let col_idx = (node.idx() + 1) as c_int;
+
+                assert!(node.idx() + 1 <= num_elements);
 
                 ia.push(row_idx);
                 ja.push(col_idx);
@@ -87,6 +87,7 @@ pub fn calc_lp_bound(instance: &Instance) -> Option<usize> {
 
         glpk::glp_load_matrix(lp, (ia.len() - 1) as i32, ia.as_ptr(), ja.as_ptr(), ar.as_ptr());
         
+        // glpk::glp_write_lp(lp, ptr::null(), CString::new("debug.lp").unwrap().as_ptr());
         glpk::glp_simplex(lp, ptr::null());
 
         let z = glpk::glp_get_obj_val(lp).ceil() as usize;
